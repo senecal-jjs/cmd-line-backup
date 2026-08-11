@@ -10,3 +10,5 @@ coverage.txt
 # Local state that must never be committed
 *.key
 *.keyfile
+
+.vscode
