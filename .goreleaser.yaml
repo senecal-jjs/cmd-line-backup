@@ -49,3 +49,11 @@ homebrew_casks:
       email: 41898282+github-actions[bot]@users.noreply.github.com
     homepage: https://github.com/senecal-jjs/cmd-line-backup
     description: Incremental, encrypted, deduplicating backup utility for Amazon S3
+    # The binary is unsigned, so Gatekeeper quarantines it; strip that on install
+    # rather than requiring paid Apple notarization.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/gobackup"]
+          end
