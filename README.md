@@ -92,8 +92,10 @@ it to `~/.config/gobackup/gobackup.key`.
 > recovered. Store a copy somewhere separate from the repository — losing them means losing
 > every backup they protect.
 
-AWS credentials come from the usual places: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`,
-`~/.aws/credentials`, or an instance role.
+The bucket itself is not created for you — `gobackup init` writes the repository into an
+existing bucket. Credentials come from the standard AWS sources; see
+[AWS credentials and permissions](#aws-credentials-and-permissions) for the resolution order
+and the minimum IAM policy.
 
 ### Back up
 
@@ -162,12 +164,96 @@ Flags go after the subcommand. Every command accepts:
 | `-cache-dir` | `GOBACKUP_CACHE_DIR` | local metadata cache directory |
 | `-no-cache` | | bypass the local cache |
 | `-region` | `AWS_REGION` | AWS region |
+| | `AWS_PROFILE` | named profile in the shared AWS config |
 | `-endpoint` | | custom S3 endpoint for S3-compatible services |
 | `-path-style` | | path-style S3 addressing, needed by most S3-compatible services |
 | `-compression` | | `zstd` (default) or `none` |
 
 Setting `GOBACKUP_PASSPHRASE` is what makes scheduled backups possible; otherwise the
 passphrase is read from the terminal without echoing.
+
+### AWS credentials and permissions
+
+gobackup installs no credential provider of its own. It hands the problem to the AWS SDK's
+default resolution chain, so anything that works for the `aws` CLI works here too, and the
+credentials never appear in a gobackup-specific file. The chain is tried in order, and the
+first source that yields credentials wins:
+
+1. **Environment variables** — `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, plus
+   `AWS_SESSION_TOKEN` if the credentials are temporary. Omitting the session token for STS
+   credentials is the most common cause of a `SignatureDoesNotMatch` error.
+2. **The shared configuration files** — `~/.aws/credentials` and `~/.aws/config`, using the
+   profile named by `AWS_PROFILE` and otherwise `default`. `AWS_SHARED_CREDENTIALS_FILE` and
+   `AWS_CONFIG_FILE` relocate them.
+3. **Whatever the selected profile declares** — an `sso_session` for IAM Identity Center, a
+   `role_arn` with `source_profile` to assume a role, a `web_identity_token_file` for IRSA on
+   EKS, or a `credential_process` command. These are handled entirely by the SDK; gobackup
+   does nothing special for any of them.
+4. **Container credentials** — the task role, via `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or
+   `AWS_CONTAINER_CREDENTIALS_FULL_URI` on ECS and Fargate.
+5. **The EC2 instance metadata service** — the instance profile role.
+
+There is no `-profile` flag. `AWS_PROFILE` is the only way to select a profile:
+
+```sh
+AWS_PROFILE=backups gobackup backup ~/Documents
+```
+
+#### Region
+
+A region has to resolve from somewhere or the SDK refuses to build a client. `-region` wins if
+given and falls back to `AWS_REGION`; if neither is set, gobackup leaves the region unset and
+lets the SDK resolve it, which picks up `AWS_DEFAULT_REGION` or the profile's `region` key.
+S3-compatible servers ignore the region but still need one to be present — use `us-east-1`.
+
+#### Minimum IAM policy
+
+Backing up needs write access, restoring and verifying need read access, and listing needs
+bucket-level access. Scope the object permissions to the repository prefix rather than the
+whole bucket:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-bucket",
+      "Condition": {"StringLike": {"s3:prefix": "backups/*"}}
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": "arn:aws:s3:::my-bucket/backups/*"
+    }
+  ]
+}
+```
+
+Each action corresponds to something the backend actually does:
+
+| Action | Needed for |
+|---|---|
+| `s3:ListBucket` | enumerating packs, indexes, and snapshots — `list`, `verify`, and index loading |
+| `s3:GetObject` | reading objects and their metadata, including `HeadObject` — `restore`, `verify` |
+| `s3:PutObject` | storing objects, including every step of a multipart upload — `init`, `backup` |
+| `s3:AbortMultipartUpload` | discarding the parts of an upload that failed partway |
+| `s3:DeleteObject` | removing an object whose upload came up short, so a truncated pack is never left behind |
+
+If the bucket enforces SSE-KMS, the same principal also needs `kms:GenerateDataKey` and
+`kms:Encrypt` to back up, and `kms:Decrypt` to restore or to run `verify -read-data`.
+
+A read-only principal — `s3:ListBucket` and `s3:GetObject` alone — is enough for `restore` and
+`verify`, which is a reasonable split for a machine that should be able to recover from a
+repository but never write to it.
+
+### Local repositories
 
 A local directory works as a repository, which is useful for testing and for backups to an
 external or network-mounted disk:
