@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -169,6 +170,56 @@ func TestDecodeRejectsMalformedInput(t *testing.T) {
 	huge[4], huge[5], huge[6], huge[7] = 0xFF, 0xFF, 0xFF, 0xFF
 	if _, err := decode(huge); !errors.Is(err, ErrBadFormat) {
 		t.Errorf("got %v, want ErrBadFormat for an absurd pack count", err)
+	}
+}
+
+// TestDecodeRejectsBeforeAllocating checks that malformed counts are refused
+// *before* they are used to size an allocation, not merely that an error comes
+// back eventually.
+//
+// The distinction is what separates a clean rejection from a crash. A four-byte
+// count field covers values up to 4294967295, and at 56 bytes per PackEntries
+// that is a 240 GB request. Reserving it first and validating afterwards still
+// produces the right error on a machine with lazy overcommit, so the difference
+// is invisible on macOS while being fatal on a memory-limited Linux CI runner.
+// Asserting on allocation, rather than on the returned error, is the only way to
+// pin that down.
+func TestDecodeRejectsBeforeAllocating(t *testing.T) {
+	valid := encode([]PackEntries{{PackID: crypto.ID{1}, Entries: makeEntries(2, 1)}})
+
+	tests := []struct {
+		name   string
+		mutate func([]byte)
+	}{
+		{"absurd pack count", func(b []byte) {
+			b[4], b[5], b[6], b[7] = 0xFF, 0xFF, 0xFF, 0xFF
+		}},
+		{"absurd entry count", func(b []byte) {
+			// The entry count sits just past the version, pack count, and pack ID.
+			off := 8 + crypto.IDSize
+			b[off], b[off+1], b[off+2], b[off+3] = 0xFF, 0xFF, 0xFF, 0xFF
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := bytes.Clone(valid)
+			tt.mutate(data)
+
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+
+			if _, err := decode(data); !errors.Is(err, ErrBadFormat) {
+				t.Fatalf("got %v, want ErrBadFormat", err)
+			}
+
+			runtime.ReadMemStats(&after)
+			if grew := after.TotalAlloc - before.TotalAlloc; grew > 1<<20 {
+				t.Errorf("decode allocated %d bytes while rejecting malformed input; "+
+					"the size must be validated before it is allocated", grew)
+			}
+		})
 	}
 }
 

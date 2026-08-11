@@ -185,6 +185,20 @@ func decode(data []byte) ([]PackEntries, error) {
 
 	packCount := binary.LittleEndian.Uint32(data[4:])
 	off := 8
+
+	// The declared count is attacker-controlled, so it must be checked against
+	// what the object could actually hold before it is used to size an
+	// allocation. Every pack costs at least an ID and an entry count in the
+	// encoding, which gives a hard upper bound derived from the data itself
+	// rather than an arbitrary cap. Skipping this check is enough for a corrupt
+	// or hostile index object to request hundreds of gigabytes and take the
+	// process down with it.
+	const minPackSize = crypto.IDSize + 4
+	maxPacks := (len(data) - 8) / minPackSize
+	if uint64(packCount) > uint64(maxPacks) {
+		return nil, fmt.Errorf("%w: object declares %d packs, but it is only large enough for %d",
+			ErrBadFormat, packCount, maxPacks)
+	}
 	packs := make([]PackEntries, 0, packCount)
 
 	for p := uint32(0); p < packCount; p++ {
@@ -198,8 +212,9 @@ func decode(data []byte) ([]PackEntries, error) {
 		entryCount := binary.LittleEndian.Uint32(data[off:])
 		off += 4
 
-		need := int(entryCount) * entrySize
-		if need < 0 || off+need > len(data) {
+		// Same reasoning, and computed in 64-bit so the multiplication cannot
+		// overflow into a value that looks acceptable on a 32-bit platform.
+		if uint64(entryCount)*entrySize > uint64(len(data)-off) {
 			return nil, fmt.Errorf("%w: pack %s claims %d entries, which do not fit in the object",
 				ErrBadFormat, packID.Short(), entryCount)
 		}
