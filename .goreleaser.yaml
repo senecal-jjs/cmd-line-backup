@@ -36,7 +36,7 @@ checksum:
 changelog:
   use: github
 
-brews:
+homebrew_casks:
   - name: gobackup
     ids:
       - gobackup
@@ -49,6 +49,3 @@ brews:
       email: 41898282+github-actions[bot]@users.noreply.github.com
     homepage: https://github.com/senecal-jjs/cmd-line-backup
     description: Incremental, encrypted, deduplicating backup utility for Amazon S3
-    directory: Formula
-    test: |
-      system "#{bin}/gobackup", "--help"
