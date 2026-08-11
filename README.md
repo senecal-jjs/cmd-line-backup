@@ -42,10 +42,39 @@ The effect, as measured by the test suite:
 ## Installation
 
 ```sh
+brew tap senecal-jjs/homebrew-tap
+brew install senecal-jjs/homebrew-tap/gobackup
+```
+
+Official release binaries are published for macOS and Linux.
+
+Building from source requires Go 1.25 or later.
+
+Build from source instead:
+
+```sh
 go build -o bin/gobackup ./cmd/gobackup
 ```
 
-Requires Go 1.25 or later.
+### Release and Homebrew publishing (maintainers)
+
+Releases are automated with GoReleaser via `.github/workflows/release.yml`.
+
+One-time setup:
+
+1. Create `senecal-jjs/homebrew-tap` with a `Formula/` directory.
+2. Create a fine-grained GitHub token that can write to that tap repository.
+3. Add it to this repository as `HOMEBREW_TAP_GITHUB_TOKEN`.
+
+Publish a release and update Homebrew:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds archives, publishes a GitHub release, and commits an updated
+formula to the tap repository.
 
 ## Getting started
 
