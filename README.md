@@ -42,8 +42,8 @@ The effect, as measured by the test suite:
 ## Installation
 
 ```sh
-brew tap senecal-jjs/homebrew-tap
-brew install senecal-jjs/homebrew-tap/gobackup
+brew tap senecal-jjs/homebrew-tools
+brew install senecal-jjs/homebrew-tools/gobackup
 ```
 
 Official release binaries are published for macOS and Linux.
