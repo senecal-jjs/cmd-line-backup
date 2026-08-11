@@ -1,0 +1,12 @@
+# Binaries
+/bin/
+/gobackup
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+
+# Local state that must never be committed
+*.key
+*.keyfile
