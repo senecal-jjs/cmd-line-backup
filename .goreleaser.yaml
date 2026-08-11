@@ -1,0 +1,51 @@
+version: 2
+
+project_name: gobackup
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: gobackup
+    main: ./cmd/gobackup
+    binary: gobackup
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X github.com/senecal-jjs/cmd-line-backup/internal/cli.version={{.Version}}
+
+archives:
+  - id: gobackup
+    ids:
+      - gobackup
+    formats:
+      - tar.gz
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+
+homebrew_casks:
+  - name: gobackup
+    ids:
+      - gobackup
+    repository:
+      owner: senecal-jjs
+      name: homebrew-tools
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_author:
+      name: github-actions[bot]
+      email: 41898282+github-actions[bot]@users.noreply.github.com
+    homepage: https://github.com/senecal-jjs/cmd-line-backup
+    description: Incremental, encrypted, deduplicating backup utility for Amazon S3

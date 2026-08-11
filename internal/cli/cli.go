@@ -31,7 +31,7 @@ func commands() []command {
 	}
 }
 
-const version = "0.1.0-dev"
+var version = "dev"
 
 // Run dispatches to a subcommand.
 func Run(args []string, out, errOut io.Writer) error {
