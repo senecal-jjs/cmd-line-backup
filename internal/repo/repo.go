@@ -64,6 +64,14 @@ func fromChunker(c chunker.Config) ChunkerConfig {
 
 const configAADLabel = "gobackup v1 config"
 
+// Defaults for the checkpoint fields of Options. They bound how much upload
+// work an interrupted run forces a retry of: at worst one checkpoint's worth
+// of packs, rather than the whole run.
+const (
+	defaultCheckpointPacks    = 16
+	defaultCheckpointInterval = 2 * time.Minute
+)
+
 // Options control how a repository is opened.
 type Options struct {
 	// CacheDir is the base directory for the local cache. Empty selects the
@@ -79,6 +87,14 @@ type Options struct {
 	// repository. Ignored when opening an existing one, whose stored settings
 	// always win.
 	Chunker chunker.Config
+
+	// CheckpointPacks and CheckpointInterval control how often the pack index
+	// is persisted mid-run: whichever threshold is reached first triggers a
+	// checkpoint. Zero selects a default. NoCheckpoint disables checkpointing
+	// entirely, writing the index only once at Flush, as before.
+	CheckpointPacks    int
+	CheckpointInterval time.Duration
+	NoCheckpoint       bool
 }
 
 // A Repository is an open gobackup repository.
@@ -91,6 +107,15 @@ type Repository struct {
 
 	compression pack.Compression
 	chunkerCfg  chunker.Config
+
+	// checkpointPacks, checkpointInterval, and checkpointDisabled configure when
+	// a checkpoint is due; lastCheckpoint and checkpointing track its state.
+	// See recordPack and writeIndex.
+	checkpointPacks    int
+	checkpointInterval time.Duration
+	checkpointDisabled bool
+	lastCheckpoint     time.Time
+	checkpointing      bool
 
 	// mu guards the open pack, the list of packs written during this run, and
 	// the sticky failure below.
@@ -179,14 +204,27 @@ func newRepository(be backend.Backend, key *crypto.Key, cfg Config, idx *index.I
 		}
 	}
 
+	checkpointPacks := opts.CheckpointPacks
+	if checkpointPacks <= 0 {
+		checkpointPacks = defaultCheckpointPacks
+	}
+	checkpointInterval := opts.CheckpointInterval
+	if checkpointInterval <= 0 {
+		checkpointInterval = defaultCheckpointInterval
+	}
+
 	return &Repository{
-		be:          be,
-		key:         key,
-		cfg:         cfg,
-		idx:         idx,
-		cache:       c,
-		compression: opts.Compression,
-		chunkerCfg:  chunkerCfg,
+		be:                 be,
+		key:                key,
+		cfg:                cfg,
+		idx:                idx,
+		cache:              c,
+		compression:        opts.Compression,
+		chunkerCfg:         chunkerCfg,
+		checkpointPacks:    checkpointPacks,
+		checkpointInterval: checkpointInterval,
+		checkpointDisabled: opts.NoCheckpoint,
+		lastCheckpoint:     time.Now(),
 	}, nil
 }
 

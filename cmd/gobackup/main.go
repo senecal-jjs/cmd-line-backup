@@ -10,7 +10,7 @@ import (
 
 func main() {
 	if err := cli.Run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		if err != cli.ErrUsage {
+		if err != cli.ErrUsage && err != cli.ErrInterrupted {
 			fmt.Fprintf(os.Stderr, "gobackup: %v\n", err)
 		}
 		os.Exit(1)

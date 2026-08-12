@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/senecal-jjs/cmd-line-backup/internal/backend"
 	"github.com/senecal-jjs/cmd-line-backup/internal/cache"
@@ -96,9 +97,61 @@ func (r *Repository) uploadPack(ctx context.Context, p *pack.Pack) error {
 	// Only after the pack is durable may its blobs be treated as stored.
 	r.idx.AddPack(p.ID, p.Entries)
 
+	// Checkpointing persists an index object covering everything uploaded so
+	// far, so an interrupted run only has to redo the upload work since the
+	// last checkpoint rather than the whole run.
+	if r.recordPack(p.ID, p.Entries) {
+		if err := r.writeIndex(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// recordPack appends a pack to the pending checkpoint batch and reports
+// whether a checkpoint is now due. Only one caller is ever told a checkpoint
+// is due at a time, so concurrent uploads cannot trigger overlapping index
+// writes.
+func (r *Repository) recordPack(id crypto.ID, entries []pack.Entry) bool {
 	r.mu.Lock()
-	r.newPacks = append(r.newPacks, index.PackEntries{PackID: p.ID, Entries: p.Entries})
+	defer r.mu.Unlock()
+
+	r.newPacks = append(r.newPacks, index.PackEntries{PackID: id, Entries: entries})
+
+	if r.checkpointDisabled || r.checkpointing {
+		return false
+	}
+	due := len(r.newPacks) >= r.checkpointPacks || time.Since(r.lastCheckpoint) >= r.checkpointInterval
+	if due {
+		r.checkpointing = true
+	}
+	return due
+}
+
+// writeIndex persists an index object covering every pack accumulated since
+// the last checkpoint (or the start of the run, if none has happened yet).
+// Safe to call even when nothing is pending, in which case it is a no-op.
+func (r *Repository) writeIndex(ctx context.Context) error {
+	r.mu.Lock()
+	packs := r.newPacks
+	r.newPacks = nil
 	r.mu.Unlock()
+
+	defer func() {
+		r.mu.Lock()
+		r.lastCheckpoint = time.Now()
+		r.checkpointing = false
+		r.mu.Unlock()
+	}()
+
+	if len(packs) == 0 {
+		return nil
+	}
+
+	if _, err := index.Save(ctx, r.be, r.key, packs, indexCache{r.cache}); err != nil {
+		r.fail(err)
+		return err
+	}
 	return nil
 }
 
@@ -165,7 +218,7 @@ func (r *Repository) LoadTree(ctx context.Context, id crypto.ID) (*snapshot.Tree
 }
 
 // Flush finishes the open pack and writes an index object covering every pack
-// created during this run.
+// created since the last checkpoint (see recordPack and writeIndex).
 //
 // It must be called before the snapshot is saved. The ordering -- packs, then
 // index, then snapshot -- is what guarantees that a snapshot visible in the
@@ -191,22 +244,7 @@ func (r *Repository) Flush(ctx context.Context) error {
 		}
 	}
 
-	r.mu.Lock()
-	packs := r.newPacks
-	r.newPacks = nil
-	r.mu.Unlock()
-
-	if len(packs) == 0 {
-		// Nothing new was stored, which is the normal outcome of backing up
-		// unchanged data.
-		return nil
-	}
-
-	if _, err := index.Save(ctx, r.be, r.key, packs, indexCache{r.cache}); err != nil {
-		r.fail(err)
-		return err
-	}
-	return nil
+	return r.writeIndex(ctx)
 }
 
 // SaveSnapshot writes a snapshot object. Flush must have completed first.

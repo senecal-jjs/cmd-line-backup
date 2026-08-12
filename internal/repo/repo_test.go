@@ -266,6 +266,126 @@ func TestPackRollover(t *testing.T) {
 	}
 }
 
+// TestCheckpointPersistsIndexMidRun verifies that an index object is written
+// as soon as a checkpoint is due, rather than only at Flush, so an interrupted
+// run does not lose everything uploaded so far.
+func TestCheckpointPersistsIndexMidRun(t *testing.T) {
+	be, key := testBackend(t), testKey(t)
+	ctx := context.Background()
+
+	opts := testOptions(t)
+	opts.CheckpointPacks = 1
+	opts.CheckpointInterval = time.Hour // pack count must trigger first
+	r, err := Init(ctx, be, key, opts)
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Incompressible payloads spanning several packs, as in TestPackRollover.
+	const blobSize = 1 << 20
+	for i := 0; i < 20; i++ {
+		if _, _, err := r.SaveBlob(ctx, pack.BlobData, randomBytes(blobSize, int64(i))); err != nil {
+			t.Fatalf("SaveBlob: %v", err)
+		}
+	}
+
+	var indexObjects int
+	if err := be.List(ctx, backend.TypeIndex, func(backend.FileInfo) error {
+		indexObjects++
+		return nil
+	}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if indexObjects == 0 {
+		t.Fatal("no index object was written before Flush; checkpointing did not happen")
+	}
+
+	if err := r.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+// TestInterruptedRunResumesFromCheckpoint simulates a process dying mid-backup
+// after several packs have already checkpointed: the run never calls Flush or
+// SaveSnapshot, so nothing beyond the periodic checkpoints is persisted.
+// Reopening the repository must already know about every checkpointed blob, so
+// a resumed backup does not re-upload it.
+func TestInterruptedRunResumesFromCheckpoint(t *testing.T) {
+	be, key := testBackend(t), testKey(t)
+	ctx := context.Background()
+
+	opts := testOptions(t)
+	opts.CheckpointPacks = 1
+	opts.CheckpointInterval = time.Hour
+	r, err := Init(ctx, be, key, opts)
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Each blob alone exceeds the pack target, so every SaveBlob call finishes
+	// and checkpoints its own pack before returning, with no ambiguous tail.
+	blobSize := pack.TargetSize + 1024
+	var checkpointed [][]byte
+	for i := 0; i < 3; i++ {
+		content := randomBytes(blobSize, int64(i))
+		if _, _, err := r.SaveBlob(ctx, pack.BlobData, content); err != nil {
+			t.Fatalf("SaveBlob: %v", err)
+		}
+		checkpointed = append(checkpointed, content)
+	}
+	// The run "crashes" here: no Flush, no SaveSnapshot. r is simply abandoned,
+	// mimicking a process that never gets to finish.
+
+	resumed, err := Open(ctx, be, key, opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i, content := range checkpointed {
+		_, added, err := resumed.SaveBlob(ctx, pack.BlobData, content)
+		if err != nil {
+			t.Fatalf("SaveBlob(%d): %v", i, err)
+		}
+		if added {
+			t.Errorf("blob %d was re-uploaded after resuming; it should have been known from a checkpoint", i)
+		}
+	}
+}
+
+// TestCheckpointDisabled confirms NoCheckpoint keeps the old behavior of
+// writing the index only at Flush.
+func TestCheckpointDisabled(t *testing.T) {
+	be, key := testBackend(t), testKey(t)
+	ctx := context.Background()
+
+	opts := testOptions(t)
+	opts.CheckpointPacks = 1
+	opts.NoCheckpoint = true
+	r, err := Init(ctx, be, key, opts)
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	blobSize := pack.TargetSize + 1024
+	if _, _, err := r.SaveBlob(ctx, pack.BlobData, randomBytes(blobSize, 1)); err != nil {
+		t.Fatalf("SaveBlob: %v", err)
+	}
+
+	var indexObjects int
+	if err := be.List(ctx, backend.TypeIndex, func(backend.FileInfo) error {
+		indexObjects++
+		return nil
+	}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if indexObjects != 0 {
+		t.Fatal("an index object was written before Flush despite NoCheckpoint")
+	}
+
+	if err := r.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
 // TestWriteOrdering verifies the ordering guarantee that makes interrupted
 // backups safe: a snapshot is only written after the index, which is only
 // written after the packs it describes.

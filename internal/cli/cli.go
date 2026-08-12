@@ -7,12 +7,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"sort"
+	"syscall"
 )
 
 // ErrUsage signals that usage information was already written to the output and
 // no further error message should be printed.
 var ErrUsage = errors.New("usage")
+
+// ErrInterrupted signals that a command was aborted by SIGINT/SIGTERM. Its
+// message was already written to the output, so callers should not print err
+// again.
+var ErrInterrupted = errors.New("interrupted")
 
 // command is a single gobackup subcommand.
 type command struct {
@@ -52,7 +60,20 @@ func Run(args []string, out, errOut io.Writer) error {
 
 	for _, c := range commands() {
 		if c.name == name {
-			return c.run(context.Background(), args[1:], out, errOut)
+			// Every write is an immutable, uniquely named object (see the repo
+			// and archiver packages), so cancelling never corrupts the
+			// repository -- it only stops short, which is why a clear,
+			// resumable message is worth giving instead of a raw transport
+			// error from whatever request was in flight.
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			err := c.run(ctx, args[1:], out, errOut)
+			if err != nil && ctx.Err() != nil {
+				fmt.Fprintf(errOut, "\ngobackup: %s interrupted; safe to rerun, nothing already stored is lost\n", name)
+				return ErrInterrupted
+			}
+			return err
 		}
 	}
 

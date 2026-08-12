@@ -38,6 +38,7 @@ type globalFlags struct {
 	noCache     bool
 	cacheDir    string
 	compression string
+	maxAttempts int
 }
 
 func (g *globalFlags) register(fs *flag.FlagSet) {
@@ -51,6 +52,8 @@ func (g *globalFlags) register(fs *flag.FlagSet) {
 	fs.BoolVar(&g.noCache, "no-cache", false, "do not use the local metadata cache")
 	fs.StringVar(&g.cacheDir, "cache-dir", os.Getenv(envCacheDir), "local cache directory (env GOBACKUP_CACHE_DIR)")
 	fs.StringVar(&g.compression, "compression", "zstd", "compression for new data: zstd or none")
+	fs.IntVar(&g.maxAttempts, "max-attempts", 0,
+		"retries for a failed S3 request before giving up (default: the backend's own default)")
 }
 
 // defaultKeyfile returns the conventional keyfile location.
@@ -94,6 +97,7 @@ func (g *globalFlags) openBackend(ctx context.Context) (backend.Backend, error) 
 		cfg.Region = g.region
 		cfg.Endpoint = g.endpoint
 		cfg.UsePathStyle = g.pathStyle
+		cfg.MaxAttempts = g.maxAttempts
 		return s3.Open(ctx, cfg)
 	}
 

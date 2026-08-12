@@ -374,6 +374,23 @@ timestamps, which host the data came from, or whether any particular file is pre
 - **The client is trusted.** Anyone who can read your keyfile and passphrase can read your
   backups.
 
+## Interrupted backups
+
+A backup can be interrupted at any point — a closed laptop lid, Ctrl-C, a killed process, a
+lost network connection — without corrupting the repository. Packs and index objects are
+immutable and additive, and a snapshot is only written last, after everything it references
+is durable, so an interrupted run never produces a snapshot pointing at missing data.
+
+Long backups also checkpoint periodically: an index object is written every few packs (or
+every couple of minutes, whichever comes first), not only at the very end. Rerunning
+`backup` after an interruption skips uploading anything already checkpointed; at most the
+work since the last checkpoint has to be redone. Files still have to be re-read from disk to
+recompute their chunks (there is no metadata fast path without a completed parent
+snapshot), but nothing already durable is re-uploaded.
+
+`Ctrl-C`/`SIGTERM` are caught and reported as an interruption rather than a raw error,
+since it's always safe to just rerun the same command.
+
 ## Current limitations
 
 Deliberately out of scope for this version:
