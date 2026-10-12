@@ -63,14 +63,19 @@ from the repository itself.
 		return err
 	}
 
-	r, err := repo.Init(ctx, be, key, opts)
-	if err != nil {
+	// The keyfile is written before the repository exists. In the other order,
+	// a failure to write the keyfile would leave behind a repository that no key
+	// can ever open; this way the worst case is a stray keyfile, removed below.
+	if err := key.SaveKeyfile(keyfilePath, passphrase); err != nil {
 		return err
 	}
 
-	if err := key.SaveKeyfile(keyfilePath, passphrase); err != nil {
-		return fmt.Errorf("the repository was created but its keyfile could not be written, "+
-			"which leaves the repository unreadable: %w", err)
+	r, err := repo.Init(ctx, be, key, opts)
+	if err != nil {
+		if rmErr := os.Remove(keyfilePath); rmErr != nil {
+			return fmt.Errorf("%w (the new keyfile %s could not be removed: %v)", err, keyfilePath, rmErr)
+		}
+		return err
 	}
 
 	fmt.Fprintf(out, "Created repository %s\n", be.Location())

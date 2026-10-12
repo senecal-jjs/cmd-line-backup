@@ -51,6 +51,8 @@ type Node struct {
 	Name string   `json:"name"`
 	Type NodeType `json:"type"`
 
+	// Mode holds the permission bits plus setuid, setgid, and sticky; the file
+	// type is recorded separately in Type.
 	Mode fs.FileMode `json:"mode"`
 	UID  uint32      `json:"uid"`
 	GID  uint32      `json:"gid"`
@@ -60,8 +62,13 @@ type Node struct {
 	// restored onto the extracted file; ChangeTime (the inode change time) is
 	// only used for comparison, because unlike ModTime it cannot be set by
 	// ordinary programs and so is much harder to spoof.
+	//
+	// The access time is deliberately not recorded. It changes whenever
+	// anything reads a file -- including the backup itself listing a directory
+	// -- so storing it would make every tree on the path to a merely-read file
+	// differ from the previous run and be stored again. Trees written by older
+	// versions may carry an "atime" field, which is ignored.
 	ModTime    time.Time `json:"mtime"`
-	AccessTime time.Time `json:"atime,omitzero"`
 	ChangeTime time.Time `json:"ctime,omitzero"`
 
 	// LinkTarget is the destination of a symlink.

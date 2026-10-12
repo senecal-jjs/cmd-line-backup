@@ -21,3 +21,24 @@ jobs:
         run: go test -race ./...
       - name: Build
         run: go build ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      # Keep in step with the default in scripts/integration-test.sh.
+      MINIO_VERSION: RELEASE.2025-09-07T16-13-09Z
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+      # MinIO publishes no images or binaries any more, so the script builds a
+      # pinned release from source; caching the binary skips that after the
+      # first run.
+      - name: Cache MinIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/gobackup/minio
+          key: minio-${{ runner.os }}-${{ env.MINIO_VERSION }}
+      - name: S3 integration tests
+        run: make test-integration

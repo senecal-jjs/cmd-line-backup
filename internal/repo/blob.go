@@ -46,12 +46,21 @@ func (r *Repository) addToPack(blobType pack.BlobType, id crypto.ID, plaintext [
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Once a write has failed this run can never produce a snapshot, so carrying
+	// on would only spend time and bandwidth uploading data nothing will use.
+	if r.failed != nil {
+		return nil, false, fmt.Errorf("repo: an earlier write failed: %w", r.failed)
+	}
+
 	// Re-check under the lock: another goroutine may have stored this blob
 	// since the caller's optimistic check.
 	if r.idx.Has(id) {
 		return nil, false, nil
 	}
 	if r.writer != nil && r.writer.Has(id) {
+		return nil, false, nil
+	}
+	if _, ok := r.inflight[id]; ok {
 		return nil, false, nil
 	}
 
@@ -77,6 +86,7 @@ func (r *Repository) addToPack(blobType pack.BlobType, id crypto.ID, plaintext [
 		return nil, added, err
 	}
 	r.writer = nil
+	r.markInflight(finished)
 	return finished, added, nil
 }
 
@@ -93,13 +103,26 @@ func (r *Repository) uploadPack(ctx context.Context, p *pack.Pack) error {
 		return err
 	}
 
-	// Only after the pack is durable may its blobs be treated as stored.
+	// Only after the pack is durable may its blobs be treated as stored. The
+	// index is updated before the blobs leave the in-flight set so that there is
+	// no moment at which a blob is in neither.
 	r.idx.AddPack(p.ID, p.Entries)
 
 	r.mu.Lock()
 	r.newPacks = append(r.newPacks, index.PackEntries{PackID: p.ID, Entries: p.Entries})
+	for _, e := range p.Entries {
+		delete(r.inflight, e.ID)
+	}
 	r.mu.Unlock()
 	return nil
+}
+
+// markInflight records a finished pack's blobs as on their way to storage. The
+// caller holds r.mu.
+func (r *Repository) markInflight(p *pack.Pack) {
+	for _, e := range p.Entries {
+		r.inflight[e.ID] = struct{}{}
+	}
 }
 
 // fail records the first write failure of the session.
@@ -186,6 +209,9 @@ func (r *Repository) Flush(ctx context.Context) error {
 			r.fail(err)
 			return err
 		}
+		r.mu.Lock()
+		r.markInflight(finished)
+		r.mu.Unlock()
 		if err := r.uploadPack(ctx, finished); err != nil {
 			return err
 		}
@@ -221,16 +247,16 @@ func (r *Repository) SaveSnapshot(ctx context.Context, s *snapshot.Snapshot) (cr
 
 // LoadSnapshot reads a snapshot by ID.
 func (r *Repository) LoadSnapshot(ctx context.Context, id crypto.ID) (*snapshot.Snapshot, error) {
-	return snapshot.Load(ctx, r.be, r.key, id)
+	return snapshot.Load(ctx, r.be, r.key, id, snapshotCache{r.cache})
 }
 
 // ListSnapshots returns every snapshot, newest first.
 func (r *Repository) ListSnapshots(ctx context.Context) ([]*snapshot.Snapshot, error) {
-	return snapshot.List(ctx, r.be, r.key)
+	return snapshot.List(ctx, r.be, r.key, snapshotCache{r.cache})
 }
 
 // FindSnapshot resolves a snapshot reference: a full ID, an unambiguous prefix,
 // or "latest".
 func (r *Repository) FindSnapshot(ctx context.Context, ref string) (*snapshot.Snapshot, error) {
-	return snapshot.Find(ctx, r.be, r.key, ref)
+	return snapshot.Find(ctx, r.be, r.key, ref, snapshotCache{r.cache})
 }

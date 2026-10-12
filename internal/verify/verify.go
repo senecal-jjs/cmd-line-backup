@@ -209,8 +209,23 @@ func checkTree(ctx context.Context, r *repo.Repository, treeID crypto.ID, path s
 	}
 }
 
-// readAllPacks downloads every pack and verifies each blob against its ID.
+// readAllPacks downloads every pack and verifies each blob against its ID, and
+// confirms that the index describes each pack exactly as the pack's own header
+// does.
 func readAllPacks(ctx context.Context, r *repo.Repository, packSizes map[crypto.ID]int64, opts Options, report *Report, progress func(string)) error {
+	// Group the index by pack once, so each pack's entries can be compared
+	// against its header without scanning the whole index per pack.
+	indexed := make(map[crypto.ID]map[crypto.ID]pack.Entry)
+	_ = r.Index().Each(func(id crypto.ID, loc index.Location) error {
+		entries := indexed[loc.PackID]
+		if entries == nil {
+			entries = make(map[crypto.ID]pack.Entry)
+			indexed[loc.PackID] = entries
+		}
+		entries[id] = loc.Entry
+		return nil
+	})
+
 	ids := make([]crypto.ID, 0, len(packSizes))
 	for id := range packSizes {
 		ids = append(ids, id)
@@ -231,7 +246,7 @@ func readAllPacks(ctx context.Context, r *repo.Repository, packSizes map[crypto.
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			problems, bytesRead := verifyPack(ctx, r, packID)
+			problems, bytesRead := verifyPack(ctx, r, packID, indexed[packID])
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -249,18 +264,37 @@ func readAllPacks(ctx context.Context, r *repo.Repository, packSizes map[crypto.
 	return nil
 }
 
-// verifyPack downloads one pack and checks every blob it contains.
-func verifyPack(ctx context.Context, r *repo.Repository, packID crypto.ID) ([]string, int64) {
+// verifyPack downloads one pack and checks every blob it contains. indexed is
+// what the index says the pack holds.
+func verifyPack(ctx context.Context, r *repo.Repository, packID crypto.ID, indexed map[crypto.ID]pack.Entry) ([]string, int64) {
 	var problems []string
-
-	header, err := pack.LoadHeader(ctx, r.Backend(), r.Key(), packID)
-	if err != nil {
-		return []string{fmt.Sprintf("pack %s: cannot read its header: %v", packID.Short(), err)}, 0
-	}
 
 	data, err := backend.LoadAll(ctx, r.Backend(), backend.Handle{Type: backend.TypePack, Name: packID.String()})
 	if err != nil {
 		return []string{fmt.Sprintf("pack %s: cannot be read: %v", packID.Short(), err)}, 0
+	}
+
+	header, err := pack.ParseHeader(r.Key(), packID, data)
+	if err != nil {
+		return []string{fmt.Sprintf("pack %s: cannot read its header: %v", packID.Short(), err)}, int64(len(data))
+	}
+
+	// Restores read blobs at the offsets the index gives, while the checks
+	// below decode them at the offsets the header gives. The two must agree, or
+	// a blob that verifies here could still be unreadable during a restore.
+	inHeader := make(map[crypto.ID]bool, len(header.Entries))
+	for _, entry := range header.Entries {
+		inHeader[entry.ID] = true
+		if want, ok := indexed[entry.ID]; ok && want != entry {
+			problems = append(problems, fmt.Sprintf(
+				"pack %s: the index entry for blob %s does not match the pack header", packID.Short(), entry.ID.Short()))
+		}
+	}
+	for id := range indexed {
+		if !inHeader[id] {
+			problems = append(problems, fmt.Sprintf(
+				"pack %s: the index lists blob %s, which the pack does not contain", packID.Short(), id.Short()))
+		}
 	}
 
 	for _, entry := range header.Entries {

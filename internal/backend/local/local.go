@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/senecal-jjs/cmd-line-backup/internal/backend"
 )
@@ -88,6 +89,25 @@ func (b *Backend) Save(ctx context.Context, h backend.Handle, rd io.Reader, size
 	}
 	if err := os.Rename(tmpName, final); err != nil {
 		return fmt.Errorf("local: publishing %s: %w", h, err)
+	}
+	// The rename itself lives in the directory, so it is only durable once the
+	// directory is synced too.
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("local: syncing directory for %s: %w", h, err)
+	}
+	return nil
+}
+
+// syncDir flushes a directory's entries to disk. Some filesystems cannot sync a
+// directory and report EINVAL; there is nothing more to be done on those.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOTSUP) {
+		return err
 	}
 	return nil
 }

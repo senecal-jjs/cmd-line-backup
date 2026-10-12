@@ -23,6 +23,5 @@ func fillSystemInfo(node *Node, fi fs.FileInfo) {
 	node.Inode = st.Ino
 	node.Device = uint64(st.Dev)
 	node.Links = uint64(st.Nlink)
-	node.AccessTime = timespecToTime(st.Atimespec.Sec, st.Atimespec.Nsec)
 	node.ChangeTime = timespecToTime(st.Ctimespec.Sec, st.Ctimespec.Nsec)
 }

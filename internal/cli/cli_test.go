@@ -154,11 +154,17 @@ func TestInitRefusesExistingRepository(t *testing.T) {
 	repoDir, _, _ := setup(t)
 
 	// Point at the same repository but a fresh keyfile path.
-	t.Setenv("GOBACKUP_KEYFILE", filepath.Join(t.TempDir(), "another.key"))
+	keyfile := filepath.Join(t.TempDir(), "another.key")
+	t.Setenv("GOBACKUP_KEYFILE", keyfile)
 	t.Setenv("GOBACKUP_REPO", repoDir)
 
 	if _, _, err := run(t, "init"); err == nil {
 		t.Error("init succeeded on a repository that already exists")
+	}
+	// The keyfile is written before the repository is created, so a failed
+	// init has to clean it up again.
+	if _, err := os.Stat(keyfile); !os.IsNotExist(err) {
+		t.Errorf("a failed init left a keyfile behind (Stat: %v)", err)
 	}
 }
 

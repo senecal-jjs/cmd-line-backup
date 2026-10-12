@@ -121,7 +121,8 @@ func (r *Restorer) RestoreSnapshot(ctx context.Context, snap *snapshot.Snapshot,
 		files []fileTask
 		dirs  []dirTask
 	)
-	if err := r.walk(ctx, snap.Tree, "", absTarget, &files, &dirs); err != nil {
+	noop := func() error { return nil } // the target itself already exists
+	if err := r.walk(ctx, snap.Tree, "", absTarget, noop, &files, &dirs); err != nil {
 		return Stats{}, err
 	}
 
@@ -148,7 +149,12 @@ type dirTask struct {
 }
 
 // walk builds the directory structure and collects the files to restore.
-func (r *Restorer) walk(ctx context.Context, treeID crypto.ID, snapPath, target string, files *[]fileTask, dirs *[]dirTask) error {
+//
+// ensureParent creates the directory being walked, along with any of its own
+// parents not created yet. It is called before anything is placed inside, so
+// that with include filters only directories leading to restored entries are
+// created, rather than the snapshot's entire directory skeleton.
+func (r *Restorer) walk(ctx context.Context, treeID crypto.ID, snapPath, target string, ensureParent func() error, files *[]fileTask, dirs *[]dirTask) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -170,25 +176,51 @@ func (r *Restorer) walk(ctx context.Context, treeID crypto.ID, snapPath, target 
 
 		switch node.Type {
 		case snapshot.NodeDir:
-			// Directories on the path to an included file must be created even
-			// if the directory itself does not match the filter.
-			if !r.excluded(childSnapPath) {
-				if err := safeMkdir(childTarget); err != nil {
-					return err
-				}
-				*dirs = append(*dirs, dirTask{path: childTarget, node: node})
-				r.addStats(func(s *Stats) { s.Dirs++ })
+			// Excluding a directory excludes everything beneath it. Its
+			// children cannot be relied on to match the pattern themselves:
+			// "*.d" matches "build.d" but not "build.d/file".
+			if r.excluded(childSnapPath) {
+				continue
 			}
 			if node.Subtree == nil {
 				return fmt.Errorf("restorer: directory %q has no subtree", childSnapPath)
 			}
-			if err := r.walk(ctx, *node.Subtree, childSnapPath, childTarget, files, dirs); err != nil {
+
+			dirTarget, dirNode, created := childTarget, node, false
+			ensureDir := func() error {
+				if created {
+					return nil
+				}
+				if err := ensureParent(); err != nil {
+					return err
+				}
+				if err := r.safeMkdir(dirTarget); err != nil {
+					return err
+				}
+				*dirs = append(*dirs, dirTask{path: dirTarget, node: dirNode})
+				r.addStats(func(s *Stats) { s.Dirs++ })
+				created = true
+				return nil
+			}
+
+			// A directory the filters select is restored even if empty. One
+			// that is merely on the way to selected entries is created only
+			// when the first of them is restored.
+			if r.included(childSnapPath) {
+				if err := ensureDir(); err != nil {
+					return err
+				}
+			}
+			if err := r.walk(ctx, *node.Subtree, childSnapPath, childTarget, ensureDir, files, dirs); err != nil {
 				return err
 			}
 
 		case snapshot.NodeSymlink:
 			if !r.included(childSnapPath) {
 				continue
+			}
+			if err := ensureParent(); err != nil {
+				return err
 			}
 			if err := r.restoreSymlink(childTarget, node); err != nil {
 				return err
@@ -197,6 +229,9 @@ func (r *Restorer) walk(ctx context.Context, treeID crypto.ID, snapPath, target 
 		case snapshot.NodeFile:
 			if !r.included(childSnapPath) {
 				continue
+			}
+			if err := ensureParent(); err != nil {
+				return err
 			}
 			*files = append(*files, fileTask{path: childTarget, node: node})
 		}
@@ -208,8 +243,8 @@ func (r *Restorer) restoreSymlink(target string, node *snapshot.Node) error {
 	if err := checkContained(r.target, filepath.Dir(target)); err != nil {
 		return err
 	}
-	if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("restorer: replacing %s: %w", target, err)
+	if err := r.clearExisting(target); err != nil {
+		return err
 	}
 	if err := os.Symlink(node.LinkTarget, target); err != nil {
 		return fmt.Errorf("restorer: creating symlink %s: %w", target, err)
@@ -262,18 +297,12 @@ func (r *Restorer) restoreFiles(ctx context.Context, files []fileTask) error {
 		toWrite = append(toWrite, f)
 	}
 
-	// Create and size every file up front so chunks can be written at their
-	// final offsets in any order.
-	handles := make([]*os.File, len(toWrite))
-	defer func() {
-		for _, f := range handles {
-			if f != nil {
-				f.Close()
-			}
-		}
-	}()
-
-	for i, task := range toWrite {
+	// Create every file up front so chunks can be written at their final
+	// offsets in any order. The files are closed straight away and reopened for
+	// each write: holding them all open would need one descriptor per file in
+	// the snapshot, and a restore of a large tree would fail with "too many
+	// open files".
+	for _, task := range toWrite {
 		dir := filepath.Dir(task.path)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("restorer: creating directory for %s: %w", task.path, err)
@@ -307,18 +336,16 @@ func (r *Restorer) restoreFiles(ctx context.Context, files []fileTask) error {
 			}
 			return fmt.Errorf("restorer: creating %s: %w", task.path, err)
 		}
-		handles[i] = f
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("restorer: creating %s: %w", task.path, err)
+		}
 	}
 
-	if err := r.fetchAndWrite(ctx, toWrite, handles); err != nil {
+	if err := r.fetchAndWrite(ctx, toWrite); err != nil {
 		return err
 	}
 
-	for i, task := range toWrite {
-		if err := handles[i].Close(); err != nil {
-			return fmt.Errorf("restorer: closing %s: %w", task.path, err)
-		}
-		handles[i] = nil
+	for _, task := range toWrite {
 		if err := snapshot.RestoreMetadata(task.path, task.node); err != nil {
 			return err
 		}
@@ -346,8 +373,8 @@ func (r *Restorer) linkFile(existing, target string) error {
 	if err := checkContained(r.target, dir); err != nil {
 		return err
 	}
-	if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("restorer: replacing %s: %w", target, err)
+	if err := r.clearExisting(target); err != nil {
+		return err
 	}
 	if err := os.Link(existing, target); err != nil {
 		return fmt.Errorf("restorer: linking %s to %s: %w", target, existing, err)
@@ -357,7 +384,7 @@ func (r *Restorer) linkFile(existing, target string) error {
 }
 
 // fetchAndWrite builds the read plan and executes it.
-func (r *Restorer) fetchAndWrite(ctx context.Context, files []fileTask, handles []*os.File) error {
+func (r *Restorer) fetchAndWrite(ctx context.Context, files []fileTask) error {
 	idx := r.repo.Index()
 
 	// Group every needed chunk by the pack that holds it, recording all the
@@ -408,7 +435,7 @@ func (r *Restorer) fetchAndWrite(ctx context.Context, files []fileTask, handles 
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			if err := r.readPack(ctx, packID, blobs, handles); err != nil {
+			if err := r.readPack(ctx, packID, blobs, files); err != nil {
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = err
@@ -423,7 +450,7 @@ func (r *Restorer) fetchAndWrite(ctx context.Context, files []fileTask, handles 
 }
 
 // readPack fetches the needed regions of one pack and writes the chunks out.
-func (r *Restorer) readPack(ctx context.Context, packID crypto.ID, blobs map[crypto.ID]*blobRead, handles []*os.File) error {
+func (r *Restorer) readPack(ctx context.Context, packID crypto.ID, blobs map[crypto.ID]*blobRead, files []fileTask) error {
 	reads := make([]*blobRead, 0, len(blobs))
 	for _, b := range blobs {
 		reads = append(reads, b)
@@ -458,11 +485,29 @@ func (r *Restorer) readPack(ctx context.Context, packID crypto.ID, blobs map[cry
 			}
 
 			for _, dst := range read.destinations {
-				if _, err := handles[dst.fileIndex].WriteAt(plaintext, dst.offset); err != nil {
-					return fmt.Errorf("restorer: writing chunk: %w", err)
+				if err := writeAt(files[dst.fileIndex].path, plaintext, dst.offset); err != nil {
+					return err
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// writeAt writes one chunk into a file created earlier in the restore.
+// O_NOFOLLOW keeps the write from being redirected if the file was replaced by
+// a symlink after it was created.
+func writeAt(path string, data []byte, offset int64) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("restorer: opening %s: %w", path, err)
+	}
+	if _, err := f.WriteAt(data, offset); err != nil {
+		f.Close()
+		return fmt.Errorf("restorer: writing %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("restorer: writing %s: %w", path, err)
 	}
 	return nil
 }
@@ -583,13 +628,19 @@ func within(parent, child string) bool {
 // repository -- would redirect the write outside the target. Replacing a
 // non-directory here removes that redirection before anything is written
 // through it.
-func safeMkdir(path string) error {
+//
+// Whatever occupies the place is only removed with Overwrite; otherwise the
+// restore stops rather than delete something it did not create.
+func (r *Restorer) safeMkdir(path string) error {
 	switch fi, err := os.Lstat(path); {
 	case err == nil && fi.IsDir():
 		return nil
 
 	case err == nil:
 		// A symlink or a regular file is occupying the directory's place.
+		if !r.opts.Overwrite {
+			return fmt.Errorf("restorer: %s already exists and is not a directory; pass -overwrite to replace it", path)
+		}
 		if err := os.Remove(path); err != nil {
 			return fmt.Errorf("restorer: replacing %s: %w", path, err)
 		}
@@ -600,6 +651,24 @@ func safeMkdir(path string) error {
 
 	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("restorer: creating %s: %w", path, err)
+	}
+	return nil
+}
+
+// clearExisting makes way for a symlink or hardlink at path. Anything already
+// there is removed only with Overwrite, matching how regular files are treated.
+func (r *Restorer) clearExisting(path string) error {
+	if _, err := os.Lstat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("restorer: inspecting %s: %w", path, err)
+	}
+	if !r.opts.Overwrite {
+		return fmt.Errorf("restorer: %s already exists; pass -overwrite to replace it", path)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("restorer: replacing %s: %w", path, err)
 	}
 	return nil
 }

@@ -99,6 +99,12 @@ type Archiver struct {
 	mu    sync.Mutex
 	stats snapshot.Stats
 
+	// abort cancels the run's context with the error that ended it. The first
+	// fatal failure in any worker stops every other worker and the walk itself,
+	// rather than letting them carry on reading and uploading data that no
+	// snapshot will ever reference.
+	abort context.CancelCauseFunc
+
 	// parentNodes maps absolute paths to the nodes recorded in the parent
 	// snapshot, so the unchanged-file check is a constant-time lookup.
 	parentMu    sync.Mutex
@@ -127,6 +133,10 @@ func (a *Archiver) Snapshot(ctx context.Context, paths []string) (*snapshot.Snap
 		return nil, errors.New("archiver: no paths to back up")
 	}
 
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	a.abort = cancel
+
 	cleaned := make([]string, 0, len(paths))
 	for _, p := range paths {
 		abs, err := snapshot.CleanPath(p)
@@ -152,6 +162,11 @@ func (a *Archiver) Snapshot(ctx context.Context, paths []string) (*snapshot.Snap
 	// restore reproduces the original layout.
 	rootID, err := a.archiveRoot(ctx, cleaned)
 	if err != nil {
+		// Workers stopped by abort report a bare cancellation; the error that
+		// triggered it is the one worth showing.
+		if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.Canceled) {
+			err = cause
+		}
 		return nil, err
 	}
 
@@ -400,7 +415,8 @@ func (a *Archiver) archiveDir(ctx context.Context, dir string) (crypto.ID, error
 
 	// collect is the single guarded path for appending a finished node, since
 	// directories are handled on this goroutine while files are handled by the
-	// worker pool.
+	// worker pool. Any error reaching it ends the run, so it also stops every
+	// other worker.
 	collect := func(node *snapshot.Node, err error) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -408,14 +424,27 @@ func (a *Archiver) archiveDir(ctx context.Context, dir string) (crypto.ID, error
 			if firstErr == nil {
 				firstErr = err
 			}
+			a.abort(err)
 			return
 		}
 		if node != nil {
 			nodes = append(nodes, node)
 		}
 	}
+	failed := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr != nil
+	}
 
+	// Every exit from the loop goes through wg.Wait below. Returning early would
+	// leave workers running, and still writing to the repository, after the
+	// backup had already reported its result.
 	for _, entry := range entries {
+		if failed() || ctx.Err() != nil {
+			break
+		}
+
 		path := filepath.Join(dir, entry.Name())
 		if a.excluded(path, entry.Name()) {
 			continue
@@ -424,7 +453,7 @@ func (a *Archiver) archiveDir(ctx context.Context, dir string) (crypto.ID, error
 		fi, err := entry.Info()
 		if err != nil {
 			if handled := a.handleError(path, err); handled != nil {
-				return crypto.ID{}, handled
+				collect(nil, handled)
 			}
 			continue
 		}
@@ -432,11 +461,7 @@ func (a *Archiver) archiveDir(ctx context.Context, dir string) (crypto.ID, error
 		// Directories recurse on this goroutine so that the worker pool is not
 		// consumed by goroutines that only wait on their children.
 		if fi.IsDir() {
-			node, err := a.archivePath(ctx, path, entry.Name(), fi)
-			if err != nil {
-				return crypto.ID{}, err
-			}
-			collect(node, nil)
+			collect(a.archivePath(ctx, path, entry.Name(), fi))
 			continue
 		}
 
@@ -452,6 +477,9 @@ func (a *Archiver) archiveDir(ctx context.Context, dir string) (crypto.ID, error
 	wg.Wait()
 	if firstErr != nil {
 		return crypto.ID{}, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return crypto.ID{}, fatal(err)
 	}
 
 	// NewTree imposes the canonical ordering, so the order results arrived in
