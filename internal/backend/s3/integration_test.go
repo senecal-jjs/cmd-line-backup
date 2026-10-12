@@ -1,93 +1,84 @@
 package s3_test
 
 import (
+	"bytes"
 	"context"
-	"fmt"
-	"os"
+	"errors"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/senecal-jjs/cmd-line-backup/internal/backend"
 	"github.com/senecal-jjs/cmd-line-backup/internal/backend/backendtest"
-	"github.com/senecal-jjs/cmd-line-backup/internal/backend/s3"
+	"github.com/senecal-jjs/cmd-line-backup/internal/backend/s3/s3test"
 )
 
 // TestConformance runs the shared backend conformance suite against a real
 // S3-compatible server, which is the only way to confirm that the S3 backend's
 // ranged reads, listing, and error mapping actually behave like the local
-// backend's.
-//
-// It is skipped unless an endpoint is configured. To run it against MinIO:
-//
-//	docker run -d -p 9000:9000 minio/minio server /data
-//	export GOBACKUP_S3_TEST_ENDPOINT=http://127.0.0.1:9000
-//	export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
-//	go test ./internal/backend/s3/
+// backend's. See package s3test for how to point it at a server.
 func TestConformance(t *testing.T) {
-	endpoint := os.Getenv("GOBACKUP_S3_TEST_ENDPOINT")
-	if endpoint == "" {
-		t.Skip("set GOBACKUP_S3_TEST_ENDPOINT to run S3 integration tests")
-	}
-
-	bucket := os.Getenv("GOBACKUP_S3_TEST_BUCKET")
-	if bucket == "" {
-		bucket = "gobackup-test"
-	}
-	if err := ensureBucket(t, endpoint, bucket); err != nil {
-		t.Fatalf("preparing bucket: %v", err)
-	}
-
+	server := s3test.Require(t)
 	backendtest.RunSuite(t, func(t *testing.T) backend.Backend {
-		// Each test gets its own key prefix so they start from an empty
-		// repository without needing to delete objects between runs.
-		prefix := fmt.Sprintf("test-%d-%s", time.Now().UnixNano(), t.Name())
-
-		b, err := s3.Open(t.Context(), s3.Config{
-			Bucket:       bucket,
-			Prefix:       prefix,
-			Region:       "us-east-1",
-			Endpoint:     endpoint,
-			UsePathStyle: true,
-			// A small part size makes the large-object test exercise the
-			// multipart upload path rather than a single PUT.
-			PartSize:    5 << 20,
-			Concurrency: 2,
-		})
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
-		return b
+		return server.Open(t)
 	})
 }
 
-func ensureBucket(t *testing.T, endpoint, bucket string) error {
-	t.Helper()
+// TestIntegrationPackSizedObjectIsASinglePut checks that an object the size of
+// a full pack is stored with one PutObject rather than a multipart upload. A
+// multipart upload interrupted midway leaves parts behind that S3 keeps billing
+// for, so the backend must never start one.
+func TestIntegrationPackSizedObjectIsASinglePut(t *testing.T) {
+	server := s3test.Require(t)
+	b := server.Open(t)
+	ctx := context.Background()
 
-	b, err := s3.Open(context.Background(), s3.Config{
-		Bucket:       bucket,
-		Region:       "us-east-1",
-		Endpoint:     endpoint,
-		UsePathStyle: true,
+	data := bytes.Repeat([]byte("0123456789abcdef"), (20<<20)/16) // larger than a pack
+	h := backend.Handle{Type: backend.TypePack, Name: strings.Repeat("ab", 32)}
+	if err := b.Save(ctx, h, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	prefix := strings.TrimPrefix(b.Location(), "s3://"+server.Bucket+"/")
+	head, err := server.Client(t).HeadObject(ctx, &awss3.HeadObjectInput{
+		Bucket: aws.String(server.Bucket),
+		Key:    aws.String(prefix + "/" + h.Path()),
 	})
 	if err != nil {
-		return err
+		t.Fatalf("HeadObject: %v", err)
 	}
-	defer b.Close()
+	// Multipart objects carry an ETag of the form "<hash>-<parts>".
+	if etag := aws.ToString(head.ETag); strings.Contains(etag, "-") {
+		t.Errorf("the object was stored as a multipart upload (ETag %s)", etag)
+	}
+	if uploads := server.IncompleteUploads(t, prefix); len(uploads) > 0 {
+		t.Errorf("incomplete multipart uploads were left behind: %v", uploads)
+	}
 
-	client := b.Client()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	_, err = client.CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: aws.String(bucket)})
+	got, err := backend.LoadAll(ctx, b, h)
 	if err != nil {
-		// Already existing is the normal case on repeat runs.
-		if _, headErr := client.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: aws.String(bucket)}); headErr == nil {
-			return nil
-		}
-		return err
+		t.Fatalf("LoadAll: %v", err)
 	}
-	return nil
+	if !bytes.Equal(got, data) {
+		t.Error("the object read back differs from what was saved")
+	}
+}
+
+// TestIntegrationShortBodyStoresNothing checks that a reader yielding fewer
+// bytes than declared is rejected before anything reaches the server.
+func TestIntegrationShortBodyStoresNothing(t *testing.T) {
+	server := s3test.Require(t)
+	b := server.Open(t)
+	ctx := context.Background()
+
+	h := backend.Handle{Type: backend.TypeIndex, Name: strings.Repeat("cd", 32)}
+	short := strings.NewReader("only part of the data")
+	if err := b.Save(ctx, h, short, 1000); err == nil {
+		t.Fatal("Save accepted a body shorter than its declared size")
+	}
+	if _, err := b.Stat(ctx, h); !errors.Is(err, backend.ErrNotFound) {
+		t.Errorf("a truncated object was stored (Stat: %v)", err)
+	}
 }

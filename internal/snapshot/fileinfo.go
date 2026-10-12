@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// modeMask selects the mode bits a node records: permissions plus the setuid,
+// setgid, and sticky bits, which matter for restoring executables and shared
+// directories faithfully.
+const modeMask = fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
+
 // NodeFromFileInfo builds a node describing a filesystem entry.
 //
 // path is used to read a symlink's target; name is the entry's name within its
@@ -16,7 +21,7 @@ import (
 func NodeFromFileInfo(path, name string, fi fs.FileInfo) (*Node, error) {
 	node := &Node{
 		Name: name,
-		Mode: fi.Mode().Perm(),
+		Mode: fi.Mode() & modeMask,
 		Size: uint64(fi.Size()),
 		// Times are normalized to UTC so that the same file produces the same
 		// tree bytes regardless of the machine's time zone, which deduplication
@@ -101,16 +106,17 @@ func (n *Node) IsHardlink() bool {
 }
 
 // FileMode returns the node's permissions combined with the type bits implied
-// by its node type. Only permission bits are stored, since the type is already
-// recorded separately, but listings want the familiar combined form.
+// by its node type. Only permission and special bits are stored, since the type
+// is already recorded separately, but listings want the familiar combined form.
 func (n *Node) FileMode() fs.FileMode {
+	mode := n.Mode & modeMask
 	switch n.Type {
 	case NodeDir:
-		return fs.ModeDir | n.Mode.Perm()
+		return fs.ModeDir | mode
 	case NodeSymlink:
-		return fs.ModeSymlink | n.Mode.Perm()
+		return fs.ModeSymlink | mode
 	default:
-		return n.Mode.Perm()
+		return mode
 	}
 }
 
@@ -119,8 +125,10 @@ func (n *Node) FileMode() fs.FileMode {
 //
 // Ownership is attempted but not required: restoring another user's files
 // without privileges is a normal situation, and failing the whole restore over
-// it would be unhelpful. Timestamps are applied last, because writing file
-// content updates them.
+// it would be unhelpful. Ownership is set before the mode, because changing a
+// file's owner clears its setuid and setgid bits. Timestamps are applied last,
+// because writing file content updates them. The access time is not recorded,
+// so it is set to the modification time.
 func RestoreMetadata(path string, node *Node) error {
 	if node.Type == NodeSymlink {
 		// A symlink's own metadata cannot be set portably, and chmod/chtimes
@@ -128,18 +136,14 @@ func RestoreMetadata(path string, node *Node) error {
 		return nil
 	}
 
-	if err := os.Chmod(path, node.Mode); err != nil {
-		return fmt.Errorf("snapshot: setting permissions on %s: %w", path, err)
-	}
-
 	// Best effort; lack of privilege is expected and not an error.
 	_ = os.Chown(path, int(node.UID), int(node.GID))
 
-	atime := node.AccessTime
-	if atime.IsZero() {
-		atime = node.ModTime
+	if err := os.Chmod(path, node.Mode&modeMask); err != nil {
+		return fmt.Errorf("snapshot: setting permissions on %s: %w", path, err)
 	}
-	if err := os.Chtimes(path, atime, node.ModTime); err != nil {
+
+	if err := os.Chtimes(path, node.ModTime, node.ModTime); err != nil {
 		return fmt.Errorf("snapshot: setting timestamps on %s: %w", path, err)
 	}
 	return nil

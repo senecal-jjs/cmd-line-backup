@@ -7,9 +7,9 @@
 // comes from the remote repository; nothing is ever read from the cache that has
 // not been authenticated against the repository key when it is used.
 //
-// Only immutable, content-addressed objects are cached: index objects and tree
-// blobs, both named by an ID that determines their contents. There is therefore
-// no invalidation problem to solve.
+// Only immutable objects are cached: index objects, snapshot objects, and tree
+// blobs, each named by an ID that never refers to different contents. There is
+// therefore no invalidation problem to solve.
 package cache
 
 import (
@@ -33,6 +33,9 @@ const (
 	// KindTree holds decoded directory metadata, which the incremental
 	// fast path walks on every run.
 	KindTree Kind = "tree"
+	// KindSnapshot holds sealed snapshot objects. Every command lists the
+	// snapshots, so caching them saves a request per snapshot per run.
+	KindSnapshot Kind = "snapshot"
 )
 
 // Cache is a directory of cached repository objects. The zero value is a

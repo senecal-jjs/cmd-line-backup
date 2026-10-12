@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"sort"
+	"syscall"
 )
 
 // ErrUsage signals that usage information was already written to the output and
@@ -52,13 +55,31 @@ func Run(args []string, out, errOut io.Writer) error {
 
 	for _, c := range commands() {
 		if c.name == name {
-			return c.run(context.Background(), args[1:], out, errOut)
+			ctx, stop := interruptContext()
+			defer stop()
+			return c.run(ctx, args[1:], out, errOut)
 		}
 	}
 
 	fmt.Fprintf(errOut, "gobackup: unknown command %q\n\n", name)
 	usage(errOut)
 	return ErrUsage
+}
+
+// interruptContext returns a context cancelled by SIGINT or SIGTERM, so that an
+// interrupted command stops its requests cleanly instead of dying mid-write.
+// The repository's write ordering keeps an interrupted backup safe either way;
+// cancelling just lets in-flight work wind down and the error be reported.
+//
+// After the first signal the default behaviour is restored, so a second Ctrl-C
+// still kills a process that is slow to stop.
+func interruptContext() (context.Context, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	return ctx, stop
 }
 
 func usage(w io.Writer) {

@@ -6,6 +6,7 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,7 +17,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -24,14 +24,15 @@ import (
 	"github.com/senecal-jjs/cmd-line-backup/internal/backend"
 )
 
-// Defaults for the multipart upload path. Packs are around 16 MB, so most
-// uploads are a single part; the part size matters for the occasional larger
-// object.
-const (
-	defaultPartSize    = 8 << 20
-	defaultConcurrency = 4
-	defaultMaxAttempts = 5
-)
+// defaultMaxAttempts bounds retries of failed requests when Config leaves it
+// unset.
+const defaultMaxAttempts = 5
+
+// maxPutSize is the largest object a single PutObject request may carry.
+// Repository objects are packs of a few tens of megabytes and small metadata
+// objects, so every object fits in one request and multipart uploads are never
+// needed.
+const maxPutSize = 5 << 30
 
 // Config describes how to reach a repository in S3.
 type Config struct {
@@ -56,10 +57,6 @@ type Config struct {
 
 	// MaxAttempts bounds retries of failed requests. Zero selects a default.
 	MaxAttempts int
-
-	// PartSize and Concurrency tune multipart uploads. Zero selects defaults.
-	PartSize    int64
-	Concurrency int
 }
 
 // ParseURL parses a repository location of the form s3://bucket/optional/prefix.
@@ -82,9 +79,8 @@ func ParseURL(raw string) (Config, error) {
 
 // Backend stores repository objects as S3 objects.
 type Backend struct {
-	client   *s3.Client
-	uploader *manager.Uploader
-	cfg      Config
+	client *s3.Client
+	cfg    Config
 }
 
 // Open connects to the S3 bucket described by cfg. Credentials come from the
@@ -96,12 +92,6 @@ func Open(ctx context.Context, cfg Config) (*Backend, error) {
 	}
 	if cfg.MaxAttempts == 0 {
 		cfg.MaxAttempts = defaultMaxAttempts
-	}
-	if cfg.PartSize == 0 {
-		cfg.PartSize = defaultPartSize
-	}
-	if cfg.Concurrency == 0 {
-		cfg.Concurrency = defaultConcurrency
 	}
 
 	opts := []func(*awsconfig.LoadOptions) error{
@@ -126,12 +116,7 @@ func Open(ctx context.Context, cfg Config) (*Backend, error) {
 		o.UsePathStyle = cfg.UsePathStyle
 	})
 
-	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
-		u.PartSize = cfg.PartSize
-		u.Concurrency = cfg.Concurrency
-	})
-
-	return &Backend{client: client, uploader: uploader, cfg: cfg}, nil
+	return &Backend{client: client, cfg: cfg}, nil
 }
 
 // Location implements backend.Backend.
@@ -151,49 +136,57 @@ func (b *Backend) key(h backend.Handle) string {
 }
 
 // Save implements backend.Backend.
+//
+// Every object is sent with a single PutObject request. A multipart upload
+// would cost several requests per pack and, if the process were killed midway,
+// leave behind incomplete parts that S3 keeps billing for until a lifecycle rule
+// removes them.
 func (b *Backend) Save(ctx context.Context, h backend.Handle, rd io.Reader, size int64) error {
 	if err := h.Validate(); err != nil {
 		return err
 	}
+	if size < 0 || size > maxPutSize {
+		return fmt.Errorf("s3: %s: size %d is outside the supported range", h, size)
+	}
 
-	// The uploader is happy to store whatever the reader yields. Counting the
-	// bytes lets a truncated stream be rejected instead of silently producing a
-	// short object that would only be discovered at restore time.
-	counter := &countingReader{r: rd}
+	// The body has to be seekable so the SDK can sign it and replay it on a
+	// retry, and its length is checked before anything is sent, so a truncated
+	// stream is rejected instead of being stored as a short object.
+	body, err := seekableBody(rd, size)
+	if err != nil {
+		return fmt.Errorf("s3: %s: %w", h, err)
+	}
 
 	input := &s3.PutObjectInput{
-		Bucket: aws.String(b.cfg.Bucket),
-		Key:    aws.String(b.key(h)),
-		Body:   counter,
+		Bucket:        aws.String(b.cfg.Bucket),
+		Key:           aws.String(b.key(h)),
+		Body:          body,
+		ContentLength: aws.Int64(size),
 	}
 	if b.cfg.StorageClass != "" {
 		input.StorageClass = types.StorageClass(b.cfg.StorageClass)
 	}
 
-	if _, err := b.uploader.Upload(ctx, input); err != nil {
+	if _, err := b.client.PutObject(ctx, input); err != nil {
 		return fmt.Errorf("s3: uploading %s: %w", h, err)
-	}
-	if counter.n != size {
-		// The object is already stored, so remove it rather than leave a
-		// corrupt object behind.
-		_, _ = b.client.DeleteObject(ctx, &s3.DeleteObjectInput{
-			Bucket: aws.String(b.cfg.Bucket),
-			Key:    aws.String(b.key(h)),
-		})
-		return fmt.Errorf("s3: %s: uploaded %d bytes but %d were declared", h, counter.n, size)
 	}
 	return nil
 }
 
-type countingReader struct {
-	r io.Reader
-	n int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	return n, err
+// seekableBody returns a seekable reader holding exactly size bytes from rd.
+// Callers normally pass a *bytes.Reader already, which is used without copying.
+func seekableBody(rd io.Reader, size int64) (io.ReadSeeker, error) {
+	if br, ok := rd.(*bytes.Reader); ok && int64(br.Len()) == size {
+		return br, nil
+	}
+	data, err := io.ReadAll(io.LimitReader(rd, size+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading object data: %w", err)
+	}
+	if int64(len(data)) != size {
+		return nil, fmt.Errorf("the reader yielded %d bytes but %d were declared", len(data), size)
+	}
+	return bytes.NewReader(data), nil
 }
 
 // Load implements backend.Backend.

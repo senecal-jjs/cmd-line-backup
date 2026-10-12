@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/senecal-jjs/cmd-line-backup/internal/backend"
 	"github.com/senecal-jjs/cmd-line-backup/internal/crypto"
@@ -51,13 +52,46 @@ func Save(ctx context.Context, be backend.Backend, key *crypto.Key, s *Snapshot)
 	return id, nil
 }
 
-// Load reads a single snapshot.
-func Load(ctx context.Context, be backend.Backend, key *crypto.Key, id crypto.ID) (*Snapshot, error) {
+// An ObjectCache stores sealed snapshot objects locally between runs. Snapshots
+// are immutable, so a cached copy never goes stale; it is still authenticated
+// on every use. A nil cache means every snapshot is fetched from the repository.
+type ObjectCache interface {
+	Get(id crypto.ID) ([]byte, bool)
+	Put(id crypto.ID, data []byte) error
+}
+
+// loadConcurrency bounds how many snapshot objects are fetched at once when
+// listing a repository.
+const loadConcurrency = 8
+
+// Load reads a single snapshot, consulting the cache first.
+func Load(ctx context.Context, be backend.Backend, key *crypto.Key, id crypto.ID, c ObjectCache) (*Snapshot, error) {
+	if c != nil {
+		if sealed, ok := c.Get(id); ok {
+			if s, err := openAndDecode(key, id, sealed); err == nil {
+				return s, nil
+			}
+			// A cached object that will not authenticate is corrupt; fall
+			// through and refetch it, overwriting the bad entry below.
+		}
+	}
+
 	sealed, err := backend.LoadAll(ctx, be, backend.Handle{Type: backend.TypeSnapshot, Name: id.String()})
 	if err != nil {
 		return nil, err
 	}
+	s, err := openAndDecode(key, id, sealed)
+	if err != nil {
+		return nil, err
+	}
+	if c != nil {
+		// Failing to cache only costs speed on the next run.
+		_ = c.Put(id, sealed)
+	}
+	return s, nil
+}
 
+func openAndDecode(key *crypto.Key, id crypto.ID, sealed []byte) (*Snapshot, error) {
 	plaintext, err := key.OpenMeta(sealed, snapshotAAD(id))
 	if err != nil {
 		return nil, fmt.Errorf("snapshot %s: %w", id.Short(), err)
@@ -66,7 +100,10 @@ func Load(ctx context.Context, be backend.Backend, key *crypto.Key, id crypto.ID
 }
 
 // List returns every snapshot in the repository, newest first.
-func List(ctx context.Context, be backend.Backend, key *crypto.Key) ([]*Snapshot, error) {
+//
+// Every command needs the snapshot list, so uncached snapshots are fetched
+// concurrently rather than one round trip at a time.
+func List(ctx context.Context, be backend.Backend, key *crypto.Key, c ObjectCache) ([]*Snapshot, error) {
 	var ids []crypto.ID
 	err := be.List(ctx, backend.TypeSnapshot, func(fi backend.FileInfo) error {
 		id, err := crypto.ParseID(fi.Name)
@@ -80,13 +117,34 @@ func List(ctx context.Context, be backend.Backend, key *crypto.Key) ([]*Snapshot
 		return nil, err
 	}
 
-	snapshots := make([]*Snapshot, 0, len(ids))
-	for _, id := range ids {
-		s, err := Load(ctx, be, key, id)
-		if err != nil {
-			return nil, err
-		}
-		snapshots = append(snapshots, s)
+	snapshots := make([]*Snapshot, len(ids))
+	var (
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, loadConcurrency)
+		mu       sync.Mutex
+		firstErr error
+	)
+	for i, id := range ids {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, id crypto.ID) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			s, err := Load(ctx, be, key, id, c)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			snapshots[i] = s
+		}(i, id)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
 	}
 
 	sort.Slice(snapshots, func(i, j int) bool {
@@ -107,8 +165,8 @@ var ErrNotFound = errors.New("snapshot: no matching snapshot")
 // Find resolves a user-supplied snapshot reference. It accepts a full
 // hexadecimal ID, an unambiguous prefix of one, or "latest" for the most recent
 // snapshot.
-func Find(ctx context.Context, be backend.Backend, key *crypto.Key, ref string) (*Snapshot, error) {
-	snapshots, err := List(ctx, be, key)
+func Find(ctx context.Context, be backend.Backend, key *crypto.Key, ref string, c ObjectCache) (*Snapshot, error) {
+	snapshots, err := List(ctx, be, key, c)
 	if err != nil {
 		return nil, err
 	}

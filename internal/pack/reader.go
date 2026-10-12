@@ -70,6 +70,25 @@ func LoadHeader(ctx context.Context, be backend.Backend, key *crypto.Key, packID
 	return DecodeHeader(key, packID, sealedHeader)
 }
 
+// ParseHeader recovers the header from a complete pack object that is already
+// in memory, avoiding the separate requests LoadHeader would make.
+func ParseHeader(key *crypto.Key, packID crypto.ID, data []byte) (Header, error) {
+	if len(data) < footerSize {
+		return Header{}, fmt.Errorf("%w: pack %s is only %d bytes", ErrBadFormat, packID.Short(), len(data))
+	}
+	headerLen, err := decodeFooter(data[len(data)-footerSize:])
+	if err != nil {
+		return Header{}, fmt.Errorf("pack %s: %w", packID.Short(), err)
+	}
+	end := int64(len(data)) - footerSize
+	start := end - int64(headerLen)
+	if start < 0 {
+		return Header{}, fmt.Errorf("%w: pack %s declares a %d byte header but the object is only %d bytes",
+			ErrBadFormat, packID.Short(), headerLen, len(data))
+	}
+	return DecodeHeader(key, packID, data[start:end])
+}
+
 // DecodeHeader decrypts and parses a sealed pack header.
 func DecodeHeader(key *crypto.Key, packID crypto.ID, sealedHeader []byte) (Header, error) {
 	plaintext, err := key.OpenMeta(sealedHeader, headerAAD(packID))

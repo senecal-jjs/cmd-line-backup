@@ -1,6 +1,6 @@
 BINARY := bin/gobackup
 
-.PHONY: all build test vet fmt clean release-check release-snapshot
+.PHONY: all build test test-integration vet fmt clean release-check release-snapshot
 
 all: vet test build
 
@@ -9,6 +9,10 @@ build:
 
 test:
 	go test -race ./...
+
+# Runs the S3 tests against a local MinIO server built from source on first use.
+test-integration:
+	./scripts/integration-test.sh
 
 vet:
 	go vet ./...

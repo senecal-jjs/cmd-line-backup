@@ -323,7 +323,7 @@ func TestSnapshotSaveAndLoad(t *testing.T) {
 		t.Error("Save did not record the assigned ID on the snapshot")
 	}
 
-	got, err := Load(ctx, be, key, id)
+	got, err := Load(ctx, be, key, id, nil)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -379,7 +379,7 @@ func TestListIsNewestFirst(t *testing.T) {
 		}
 	}
 
-	snapshots, err := List(ctx, be, key)
+	snapshots, err := List(ctx, be, key, nil)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -415,7 +415,7 @@ func TestFind(t *testing.T) {
 
 	newest := ids[2]
 	for _, ref := range []string{"", "latest"} {
-		got, err := Find(ctx, be, key, ref)
+		got, err := Find(ctx, be, key, ref, nil)
 		if err != nil {
 			t.Fatalf("Find(%q): %v", ref, err)
 		}
@@ -427,7 +427,7 @@ func TestFind(t *testing.T) {
 	// Full ID and a prefix must both resolve.
 	target := ids[0]
 	for _, ref := range []string{target.String(), target.String()[:8]} {
-		got, err := Find(ctx, be, key, ref)
+		got, err := Find(ctx, be, key, ref, nil)
 		if err != nil {
 			t.Fatalf("Find(%q): %v", ref, err)
 		}
@@ -436,13 +436,13 @@ func TestFind(t *testing.T) {
 		}
 	}
 
-	if _, err := Find(ctx, be, key, "ffffffffffffffff"); !errors.Is(err, ErrNotFound) {
+	if _, err := Find(ctx, be, key, "ffffffffffffffff", nil); !errors.Is(err, ErrNotFound) {
 		t.Errorf("got %v, want ErrNotFound", err)
 	}
 }
 
 func TestFindOnEmptyRepository(t *testing.T) {
-	if _, err := Find(context.Background(), testBackend(t), testKey(t), "latest"); !errors.Is(err, ErrNotFound) {
+	if _, err := Find(context.Background(), testBackend(t), testKey(t), "latest", nil); !errors.Is(err, ErrNotFound) {
 		t.Errorf("got %v, want ErrNotFound", err)
 	}
 }
@@ -482,7 +482,7 @@ func TestSnapshotIsUnreadableWithTheWrongKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if _, err := Load(ctx, be, other, id); err == nil {
+	if _, err := Load(ctx, be, other, id, nil); err == nil {
 		t.Error("a snapshot was readable with the wrong key")
 	}
 }
@@ -495,7 +495,7 @@ func TestRestoreMetadata(t *testing.T) {
 	}
 
 	want := time.Unix(1600000000, 0).UTC()
-	node := &Node{Name: "file.txt", Type: NodeFile, Mode: 0o640, ModTime: want, AccessTime: want}
+	node := &Node{Name: "file.txt", Type: NodeFile, Mode: 0o640, ModTime: want}
 	if err := RestoreMetadata(path, node); err != nil {
 		t.Fatalf("RestoreMetadata: %v", err)
 	}
@@ -536,5 +536,79 @@ func TestRestoreMetadataSkipsSymlinks(t *testing.T) {
 	}
 	if fi.Mode().Perm() != 0o600 {
 		t.Errorf("the symlink target's permissions changed to %v", fi.Mode().Perm())
+	}
+}
+
+// TestTreesDoNotRecordAccessTime guards deduplication of unchanged trees: the
+// access time changes whenever anything reads a file, so recording it would
+// make a tree differ between runs even though nothing in it was modified.
+func TestTreesDoNotRecordAccessTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(path, []byte("content"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+	node, err := NodeFromFileInfo(path, "file.txt", fi)
+	if err != nil {
+		t.Fatalf("NodeFromFileInfo: %v", err)
+	}
+	data, err := EncodeTree(NewTree([]*Node{node}))
+	if err != nil {
+		t.Fatalf("EncodeTree: %v", err)
+	}
+	if bytes.Contains(data, []byte(`"atime"`)) {
+		t.Errorf("the encoded tree records an access time: %s", data)
+	}
+
+	// Trees written by earlier versions still carry the field and must decode.
+	legacy := []byte(`{"nodes":[{"name":"a","type":"file","mode":420,"mtime":"2024-01-01T00:00:00Z","atime":"2024-01-02T00:00:00Z"}]}`)
+	if _, err := DecodeTree(legacy); err != nil {
+		t.Errorf("a tree with an atime field no longer decodes: %v", err)
+	}
+}
+
+// mapCache is an in-memory ObjectCache.
+type mapCache map[crypto.ID][]byte
+
+func (m mapCache) Get(id crypto.ID) ([]byte, bool) { d, ok := m[id]; return d, ok }
+func (m mapCache) Put(id crypto.ID, data []byte) error {
+	m[id] = append([]byte(nil), data...)
+	return nil
+}
+
+// TestSnapshotCache checks that loaded snapshots are cached, that the cached
+// copy is used, and that a corrupt cached copy is ignored.
+func TestSnapshotCache(t *testing.T) {
+	ctx := context.Background()
+	be, key := testBackend(t), testKey(t)
+	snap := &Snapshot{Time: time.Now().UTC(), Paths: []string{"/data"}, Tree: crypto.ID{1}}
+	id, err := Save(ctx, be, key, snap)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	cache := mapCache{}
+	if _, err := List(ctx, be, key, cache); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if _, ok := cache[id]; !ok {
+		t.Fatal("listing did not cache the snapshot")
+	}
+
+	// With the object gone from storage, only the cache can supply it.
+	if err := be.Remove(ctx, backend.Handle{Type: backend.TypeSnapshot, Name: id.String()}); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if got, err := Load(ctx, be, key, id, cache); err != nil || got.ID != id {
+		t.Fatalf("Load from cache = %v, %v", got, err)
+	}
+
+	// A corrupt cached copy must not be trusted.
+	cache[id][len(cache[id])-1] ^= 0xFF
+	if _, err := Load(ctx, be, key, id, cache); err == nil {
+		t.Error("a corrupt cached snapshot was accepted")
 	}
 }

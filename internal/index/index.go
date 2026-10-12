@@ -347,19 +347,51 @@ func Load(ctx context.Context, be backend.Backend, key *crypto.Key, c ObjectCach
 		return nil, err
 	}
 
+	// Every backup run adds an index object, so a repository with a cold cache
+	// can have hundreds to fetch. They are downloaded concurrently, then merged
+	// in listing order so the result does not depend on which finished first.
+	loaded := make([][]PackEntries, len(ids))
+	var (
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, loadConcurrency)
+		mu       sync.Mutex
+		firstErr error
+	)
+	for i, id := range ids {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, id crypto.ID) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			packs, err := LoadOne(ctx, be, key, id, c)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			loaded[i] = packs
+		}(i, id)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
 	idx := New()
-	for _, id := range ids {
-		packs, err := LoadOne(ctx, be, key, id, c)
-		if err != nil {
-			return nil, err
-		}
-		for _, p := range packs {
+	for i, id := range ids {
+		for _, p := range loaded[i] {
 			idx.AddPack(p.PackID, p.Entries)
 		}
 		idx.sourceID = append(idx.sourceID, id)
 	}
 	return idx, nil
 }
+
+// loadConcurrency bounds how many index objects are fetched at once.
+const loadConcurrency = 8
 
 // Rebuild reconstructs an index by reading the header of every pack in the
 // repository.

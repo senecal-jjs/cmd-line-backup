@@ -92,11 +92,16 @@ type Repository struct {
 	compression pack.Compression
 	chunkerCfg  chunker.Config
 
-	// mu guards the open pack, the list of packs written during this run, and
-	// the sticky failure below.
+	// mu guards the open pack, the packs being uploaded, the list of packs
+	// written during this run, and the sticky failure below.
 	mu       sync.Mutex
 	writer   *pack.Writer
 	newPacks []index.PackEntries
+
+	// inflight holds the IDs of blobs in packs that have been finished but not
+	// yet uploaded and indexed. Without it, a blob saved while its pack is in
+	// flight is in neither the index nor the open pack and is stored twice.
+	inflight map[crypto.ID]struct{}
 
 	// failed records the first write failure of this session. Once a pack
 	// upload fails, blobs that earlier files already reference are missing from
@@ -187,6 +192,7 @@ func newRepository(be backend.Backend, key *crypto.Key, cfg Config, idx *index.I
 		cache:       c,
 		compression: opts.Compression,
 		chunkerCfg:  chunkerCfg,
+		inflight:    make(map[crypto.ID]struct{}),
 	}, nil
 }
 
@@ -237,6 +243,15 @@ func loadConfig(ctx context.Context, be backend.Backend, key *crypto.Key) (Confi
 			cfg.Version, configVersion)
 	}
 	return cfg, nil
+}
+
+// snapshotCache adapts the local cache to the interface the snapshot package
+// expects.
+type snapshotCache struct{ c *cache.Cache }
+
+func (s snapshotCache) Get(id crypto.ID) ([]byte, bool) { return s.c.Get(cache.KindSnapshot, id) }
+func (s snapshotCache) Put(id crypto.ID, data []byte) error {
+	return s.c.Put(cache.KindSnapshot, id, data)
 }
 
 // indexCache adapts the local cache to the interface the index package expects.

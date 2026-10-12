@@ -132,8 +132,11 @@ gobackup restore -snapshot a1b2c3d4 -target /tmp/restored -include '*.pdf'
 ```
 
 Files are written under the target directory reproducing their original absolute paths, so
-a snapshot of `/home/you/docs` lands at `/tmp/restored/home/you/docs`. Existing files are
-never touched unless you pass `-overwrite`.
+a snapshot of `/home/you/docs` lands at `/tmp/restored/home/you/docs`. Existing files,
+symlinks, and anything else already in the way are never touched unless you pass
+`-overwrite`; without it the restore stops with an error instead. Excluding a directory
+excludes everything beneath it, and with `-include` only the directories leading to
+included entries are created.
 
 ### Verify
 
@@ -226,9 +229,7 @@ whole bucket:
       "Effect": "Allow",
       "Action": [
         "s3:GetObject",
-        "s3:PutObject",
-        "s3:DeleteObject",
-        "s3:AbortMultipartUpload"
+        "s3:PutObject"
       ],
       "Resource": "arn:aws:s3:::my-bucket/backups/*"
     }
@@ -242,9 +243,12 @@ Each action corresponds to something the backend actually does:
 |---|---|
 | `s3:ListBucket` | enumerating packs, indexes, and snapshots — `list`, `verify`, and index loading |
 | `s3:GetObject` | reading objects and their metadata, including `HeadObject` — `restore`, `verify` |
-| `s3:PutObject` | storing objects, including every step of a multipart upload — `init`, `backup` |
-| `s3:AbortMultipartUpload` | discarding the parts of an upload that failed partway |
-| `s3:DeleteObject` | removing an object whose upload came up short, so a truncated pack is never left behind |
+| `s3:PutObject` | storing objects — `init`, `backup` |
+
+Every object is written with a single `PutObject` request, never a multipart upload, so an
+interrupted backup cannot leave incomplete upload parts accruing charges in the bucket. Its
+length is checked before it is sent, so a truncated object is never stored. gobackup never
+deletes objects, so it needs no `s3:DeleteObject` permission.
 
 If the bucket enforces SSE-KMS, the same principal also needs `kms:GenerateDataKey` and
 `kms:Encrypt` to back up, and `kms:Decrypt` to restore or to run `verify -read-data`.
@@ -322,7 +326,7 @@ satisfies many chunks.
 
 ### Local cache
 
-Index objects and directory trees are cached under `~/.cache/gobackup/<repo-id>/` so repeat
+Index objects, snapshot objects, and directory trees are cached under `~/.cache/gobackup/<repo-id>/` so repeat
 backups do not re-download metadata. The cache is strictly an optimization: entries are
 authenticated against the repository key before use, and deleting the directory only costs
 time.
@@ -390,24 +394,36 @@ Deliberately out of scope for this version:
 ## Development
 
 ```sh
-make test          # unit and integration tests
+make test                # unit tests; S3 tests are skipped
+make test-integration    # S3 tests against a local MinIO server
 make vet
 make build
 go test -race ./...
 ```
 
-The S3 backend is held to the same conformance suite as the local backend. To run it
-against a real S3-compatible server:
+The S3 backend is held to the same conformance suite as the local backend, and the whole
+pipeline -- `init`, incremental backups, cold-cache restores, index rebuilds, `verify`, and
+interrupted backups -- is also exercised against a real S3-compatible server:
 
 ```sh
-docker run -d --rm -p 9000:9000 \
-  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-  minio/minio server /data
-
-GOBACKUP_S3_TEST_ENDPOINT=http://127.0.0.1:9000 \
-AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1 \
-  go test ./internal/backend/s3/
+make test-integration
 ```
+
+This starts a throwaway MinIO server on `127.0.0.1:9123` and runs every test whose name
+matches `Conformance|Integration`. MinIO no longer publishes container images or binaries,
+so a pinned release is built from source with `go install` on the first run (about a
+minute) and cached under `~/.cache/gobackup/minio`. Pass `MINIO_BIN=/path/to/minio` to use
+a binary you already have, `RUN=<pattern>` to select tests, or point the tests at any other
+S3-compatible server yourself:
+
+```sh
+GOBACKUP_S3_TEST_ENDPOINT=http://127.0.0.1:9000 \
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1 \
+  go test -run 'Conformance|Integration' ./...
+```
+
+Without `GOBACKUP_S3_TEST_ENDPOINT` these tests are skipped, so `make test` needs no server.
+Each test works under its own key prefix and deletes it afterwards.
 
 ### Package layout
 
